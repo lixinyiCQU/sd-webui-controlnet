@@ -1,59 +1,107 @@
-import os
-import einops
-from omegaconf import OmegaConf
 import torch
-import torch as th
 import torch.nn as nn
-from modules.shared import cmd_opts
-from modules import devices, lowvram
+from omegaconf import OmegaConf
+from modules import devices, lowvram, shared, scripts
 
-from ldm.modules.diffusionmodules.util import (
-    conv_nd,
-    linear,
-    zero_module,
-    timestep_embedding,
-)
-
-from ldm.modules.attention import SpatialTransformer
-from ldm.modules.diffusionmodules.openaimodel import UNetModel, TimestepEmbedSequential, ResBlock, Downsample, AttentionBlock
 from ldm.util import exists
+from ldm.modules.attention import SpatialTransformer
+from ldm.modules.diffusionmodules.util import conv_nd, linear, zero_module, timestep_embedding
+from ldm.modules.diffusionmodules.openaimodel import UNetModel, TimestepEmbedSequential, ResBlock, Downsample, AttentionBlock
 
 
-def load_state_dict(ckpt_path, location='cpu'):
-    _, extension = os.path.splitext(ckpt_path)
-    if extension.lower() == ".safetensors":
-        import safetensors.torch
-        state_dict = safetensors.torch.load_file(ckpt_path, device=location)
-    else:
-        state_dict = get_state_dict(torch.load(
-            ckpt_path, map_location=torch.device(location)))
-    state_dict = get_state_dict(state_dict)
-    print(f'Loaded state_dict from [{ckpt_path}]')
-    return state_dict
+class TorchHijackForUnet:
+    """
+    This is torch, but with cat that resizes tensors to appropriate dimensions if they do not match;
+    this makes it possible to create pictures with dimensions that are multiples of 8 rather than 64
+    """
+
+    def __getattr__(self, item):
+        if item == 'cat':
+            return self.cat
+
+        if hasattr(torch, item):
+            return getattr(torch, item)
+
+        raise AttributeError("'{}' object has no attribute '{}'".format(type(self).__name__, item))
+
+    def cat(self, tensors, *args, **kwargs):
+        if len(tensors) == 2:
+            a, b = tensors
+            if a.shape[-2:] != b.shape[-2:]:
+                a = torch.nn.functional.interpolate(a, b.shape[-2:], mode="nearest")
+
+            tensors = (a, b)
+
+        return torch.cat(tensors, *args, **kwargs)
 
 
-def get_state_dict(d):
-    return d.get('state_dict', d)
+th = TorchHijackForUnet()
 
 
 def align(hint, size):
     b, c, h1, w1 = hint.shape
     h, w = size
     if h != h1 or w != w1:
-         hint = torch.nn.functional.interpolate(hint, size=size, mode="nearest")
+         hint = th.nn.functional.interpolate(hint, size=size, mode="nearest")
     return hint
 
 
+def get_node_name(name, parent_name):
+    if len(name) <= len(parent_name):
+        return False, ''
+    p = name[:len(parent_name)]
+    if p != parent_name:
+        return False, ''
+    return True, name[len(parent_name):]
+
+
 class PlugableControlModel(nn.Module):
-    def __init__(self, model_path, config_path, weight=1.0, lowvram=False) -> None:
+    def __init__(self, state_dict, config_path, weight=1.0, lowvram=False, base_model=None) -> None:
         super().__init__()
-        config = OmegaConf.load(config_path)
-        
+        config = OmegaConf.load(config_path)        
         self.control_model = ControlNet(**config.model.params.control_stage_config.params)
-        state_dict = load_state_dict(model_path)
+            
         if any([k.startswith("control_model.") for k, v in state_dict.items()]):
+            
+            is_diff_model = 'difference' in state_dict
+            transfer_ctrl_opt = shared.opts.data.get("control_net_control_transfer", False) and \
+                any([k.startswith("model.diffusion_model.") for k, v in state_dict.items()])
+                
+            if (is_diff_model or transfer_ctrl_opt) and base_model is not None:
+                # apply transfer control - https://github.com/lllyasviel/ControlNet/blob/main/tool_transfer_control.py
+                
+                unet_state_dict = base_model.state_dict()
+                unet_state_dict_keys = unet_state_dict.keys()
+                final_state_dict = {}
+                counter = 0
+                for key in state_dict.keys():
+                    if not key.startswith("control_model."):
+                        continue
+                    
+                    p = state_dict[key]
+                    is_control, node_name = get_node_name(key, 'control_')
+                    key_name = node_name.replace("model.", "") if is_control else key
+
+                    if key_name in unet_state_dict_keys:
+                        if is_diff_model:
+                            # transfer control by make difference in advance
+                            p_new = p + unet_state_dict[key_name].clone().cpu()
+                        else:
+                            # transfer control by calculate offsets from (delta = p + current_unet_encoder - frozen_unet_encoder)
+                            p_new = p + unet_state_dict[key_name].clone().cpu() - state_dict["model.diffusion_model."+key_name]
+                        counter += 1
+                    else:
+                        p_new = p
+                    final_state_dict[key] = p_new
+                    
+                print(f'Offset cloned: {counter} values')
+                state_dict = final_state_dict
+                
             state_dict = {k.replace("control_model.", ""): v for k, v in state_dict.items() if k.startswith("control_model.")}
-        
+        else:
+            # assume that model is done by user
+            pass
+            
         self.control_model.load_state_dict(state_dict)
         self.lowvram = lowvram            
         self.weight = weight
@@ -65,17 +113,34 @@ class PlugableControlModel(nn.Module):
             self.control_model.to(devices.get_device_for("controlnet"))
 
     def hook(self, model, parent_model):
+        if devices.get_device_for("controlnet").type == 'mps':
+            from modules.devices import cond_cast_unet
+            
         outer = self
+        
+        def guidance_schedule_handler(x):
+            if (x.sampling_step / x.total_sampling_steps) > self.stop_guidance_percent:
+                # stop guidance
+                self.guidance_stopped = True
 
         def forward(self, x, timesteps=None, context=None, **kwargs):
             only_mid_control = outer.only_mid_control
+            
+            # hires stuffs
+            # note that this method may not works if hr_scale < 1.1
+            if abs(x.shape[-1] - outer.hint_cond.shape[-1] // 8) > 8:
+                only_mid_control = shared.opts.data.get("control_net_only_midctrl_hires", True)
+                # If you want to completely disable control net, uncomment this.
+                # return self._original_forward(x, timesteps=timesteps, context=context, **kwargs)
+            
             control = outer.control_model(x=x, hint=outer.hint_cond, timesteps=timesteps, context=context)
-
             assert timesteps is not None, ValueError(f"insufficient timestep: {timesteps}")
             hs = []
-            with torch.no_grad():
-                t_emb = timestep_embedding(
-                    timesteps, self.model_channels, repeat_only=False)
+            with th.no_grad():
+                t_emb = timestep_embedding(timesteps, self.model_channels, repeat_only=False)
+                if devices.get_device_for("controlnet").type == 'mps':
+                    t_emb = cond_cast_unet(t_emb)
+                    
                 emb = self.time_embed(t_emb)
                 h = x.type(self.dtype)
                 for module in self.input_blocks:
@@ -83,15 +148,16 @@ class PlugableControlModel(nn.Module):
                     hs.append(h)
                 h = self.middle_block(h, emb, context)
 
-            h += control.pop()
+            if not outer.guidance_stopped:
+                h += control.pop()
 
             for i, module in enumerate(self.output_blocks):
-                if only_mid_control:
-                    h = torch.cat([h, hs.pop()], dim=1)
+                if only_mid_control or outer.guidance_stopped:
+                    hs_input = hs.pop()
+                    h = th.cat([h, hs_input], dim=1)
                 else:
                     hs_input, control_input = hs.pop(), control.pop()
-                    h = align(h, hs_input.shape[-2:])
-                    h = torch.cat([h, hs_input + control_input * outer.weight], dim=1)
+                    h = th.cat([h, hs_input + control_input * outer.weight], dim=1)
                 h = module(h, emb, context)
 
             h = h.type(x.dtype)
@@ -100,7 +166,7 @@ class PlugableControlModel(nn.Module):
         def forward2(*args, **kwargs):
             # webui will handle other compoments 
             try:
-                if cmd_opts.lowvram:
+                if shared.cmd_opts.lowvram:
                     lowvram.send_everything_to_cpu()
                 if self.lowvram:
                     self.control_model.to(devices.get_device_for("controlnet"))
@@ -111,13 +177,18 @@ class PlugableControlModel(nn.Module):
         
         model._original_forward = model.forward
         model.forward = forward2.__get__(model, UNetModel)
+        scripts.script_callbacks.on_cfg_denoiser(guidance_schedule_handler)
     
-    def notify(self, cond_like, weight):
+    def notify(self, cond_like, weight, stop_guidance_percent):
+        self.stop_guidance_percent = stop_guidance_percent
+        self.guidance_stopped = False
+        
         self.hint_cond = cond_like
         self.weight = weight
         # print(self.hint_cond.shape)
 
     def restore(self, model):
+        scripts.script_callbacks.remove_current_script_callbacks()
         if not hasattr(model, "_original_forward"):
             # no such handle, ignore
             return
@@ -158,6 +229,9 @@ class ControlNet(nn.Module):
         disable_middle_self_attn=False,
         use_linear_in_transformer=False,
     ):
+        if devices.get_device_for("controlnet").type == 'mps':
+            use_fp16 = devices.dtype_unet == th.float16
+            
         super().__init__()
         if use_spatial_transformer:
             assert context_dim is not None, 'Fool!! You forgot to include the dimension of your cross-attention conditioning...'
@@ -373,15 +447,21 @@ class ControlNet(nn.Module):
         return hint
 
     def forward(self, x, hint, timesteps, context, **kwargs):
-        t_emb = timestep_embedding(
-            timesteps, self.model_channels, repeat_only=False)
+        if devices.get_device_for("controlnet").type == 'mps':
+            from modules.devices import cond_cast_unet
+        
+        t_emb = timestep_embedding(timesteps, self.model_channels, repeat_only=False)
+        if devices.get_device_for("controlnet").type == 'mps':
+            t_emb = cond_cast_unet(t_emb)
+            
         emb = self.time_embed(t_emb)
-
+        if devices.get_device_for("controlnet").type == 'mps':
+            hint = cond_cast_unet(hint)
             
         guided_hint = self.input_hint_block(hint, emb, context)
         outs = []
         
-        _, _, h1, w1 = x.shape
+        h1, w1 = x.shape[-2:]
         guided_hint = self.align(guided_hint, h1, w1)
 
         h = x.type(self.dtype)
